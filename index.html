@@ -1548,7 +1548,7 @@ let lastPixCode = "";
 // em vez de depender de alert()/prompt()/clipboard, que são
 // pouco confiáveis em navegadores mobile (inclusive in-app, como
 // os abertos de dentro do WhatsApp/Instagram).
-function showPaymentResult(pixCode, paymentUrl, customerName, pixQrImage){
+function showPaymentResult(pixCode, paymentUrl, customerName, pixQrImage, requestId){
     lastPixCode = pixCode || "";
     const body = document.getElementById("paymentBody");
     let html = `<p style="margin-bottom:14px;color:var(--muted)">Obrigado, ${customerName ? escapeOption(customerName) : "cliente"}! Seu pedido foi recebido.</p>`;
@@ -1580,6 +1580,16 @@ function showPaymentResult(pixCode, paymentUrl, customerName, pixQrImage){
 
     body.innerHTML = html;
     document.getElementById("paymentOverlay").classList.add("active");
+
+    // Fecha a tela sozinha quando o pagamento via PIX for aprovado.
+    // Só faz sentido monitorar quando existe um código PIX visível na tela
+    // (ou seja, a cliente ficou esperando aqui) e temos o request_id do
+    // pedido para consultar o status dele no Supabase. Pagamento por
+    // Cartão redireciona a cliente para fora do site, então não entra
+    // nesse monitoramento por enquanto.
+    if(pixCode && requestId){
+        startPaymentPolling(requestId);
+    }
 }
 
 async function copyPixCode(){
@@ -1612,12 +1622,90 @@ async function copyPixCode(){
 
 function closePaymentModal(){
     document.getElementById("paymentOverlay").classList.remove("active");
+    stopPaymentPolling();
 }
 
 function outsidePayment(event){
     if(event.target.id === "paymentOverlay"){
         closePaymentModal();
     }
+}
+
+// Monitoramento do status do pagamento PIX enquanto a cliente está na
+// tela de pagamento, para fechar a tela automaticamente assim que o
+// Mercado Pago confirmar o pagamento (via webhook -> n8n -> Supabase).
+// O site não tem Supabase Realtime, então o jeito mais simples é
+// perguntar de tempos em tempos ("polling") se o STATUS do pedido mudou.
+let paymentPollingIntervalId = null;
+let paymentPollingTimeoutId = null;
+
+const PAYMENT_POLL_INTERVAL_MS = 4000;
+const PAYMENT_POLL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos de segurança
+const STATUS_PAGAMENTO_CONFIRMADO = "PAGAMENTO CONFIRMADO, EM PRODUÇÃO";
+
+function stopPaymentPolling(){
+    if(paymentPollingIntervalId){
+        clearInterval(paymentPollingIntervalId);
+        paymentPollingIntervalId = null;
+    }
+    if(paymentPollingTimeoutId){
+        clearTimeout(paymentPollingTimeoutId);
+        paymentPollingTimeoutId = null;
+    }
+}
+
+function startPaymentPolling(requestId){
+    stopPaymentPolling();
+
+    if(!requestId) return;
+
+    paymentPollingIntervalId = setInterval(async function(){
+        try{
+            const response = await fetch(
+                `${SUPABASE_URL}/rest/v1/PEDIDOS?select=STATUS&REQUEST_ID=eq.${encodeURIComponent(requestId)}`,
+                {
+                    headers: {
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": "Bearer " + SUPABASE_ANON_KEY
+                    }
+                }
+            );
+
+            if(!response.ok) return;
+
+            const rows = await response.json();
+            const status = rows && rows[0] && rows[0].STATUS;
+
+            if(status === STATUS_PAGAMENTO_CONFIRMADO){
+                showPaymentApproved();
+            }
+        }catch(error){
+            // Falha de rede pontual não deve travar nada — a próxima
+            // tentativa do intervalo consulta de novo.
+            console.error("Erro ao verificar status do pagamento:", error);
+        }
+    }, PAYMENT_POLL_INTERVAL_MS);
+
+    // Rede de segurança: se por algum motivo o pagamento nunca aparecer
+    // como confirmado (ex: webhook do Mercado Pago falhar), para de
+    // perguntar depois de um tempo em vez de ficar consultando pra sempre.
+    paymentPollingTimeoutId = setTimeout(stopPaymentPolling, PAYMENT_POLL_TIMEOUT_MS);
+}
+
+function showPaymentApproved(){
+    stopPaymentPolling();
+
+    const body = document.getElementById("paymentBody");
+    if(body){
+        body.innerHTML = `
+            <div class="payment-box" style="text-align:center">
+                <div style="font-size:40px;margin-bottom:10px">✅</div>
+                <p style="color:var(--muted);font-size:16px">Pagamento aprovado!<br>Seu pedido já está em produção.</p>
+            </div>
+        `;
+    }
+
+    setTimeout(closePaymentModal, 2500);
 }
 
 function normalizePhone(phone){
@@ -2226,7 +2314,7 @@ async function finishOrder(){
             ? ("data:image/png;base64," + transactionData.qr_code_base64)
             : null;
 
-        showPaymentResult(pixCode, paymentUrl, name, pixQrImage);
+        showPaymentResult(pixCode, paymentUrl, name, pixQrImage, order.request_id);
 
     }catch(error){
         console.error("Erro ao enviar pedido:",error);
